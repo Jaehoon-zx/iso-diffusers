@@ -176,9 +176,9 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     images = []
     for i in range(len(args.validation_prompts)):
         with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
-
-        images.append(image)
+            for j in range(args.prompts_reps):
+                image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+                images.append(image)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -271,6 +271,12 @@ def parse_args():
         default=None,
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
+        "--prompts_reps",
+        type=int,
+        default=1,
+        help=("Number of generating repetitions for each validation prompt."),
     )
     parser.add_argument(
         "--output_dir",
@@ -1026,7 +1032,7 @@ def main():
                 break
 
         if accelerator.is_main_process:
-            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or epoch == 1):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
