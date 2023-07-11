@@ -20,15 +20,12 @@ import os
 import random
 import shutil
 from pathlib import Path
-# import sys
-# sys.path.append("../..")
 
 import accelerate
 import datasets
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.autograd.functional as A
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -63,7 +60,7 @@ def ddim_step(unet, x, t, y, alpha_prod_t, alpha_prod_t_prev):
 
     epsilon = unet(x, t, y)
     result = 1/(alpha_prod_t ** (0.5)) * x - (beta_prod_t ** (0.5)/alpha_prod_t ** (0.5) - beta_prod_t_prev ** (0.5)) * epsilon
-
+    return result
 ########################################
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -1015,13 +1012,9 @@ def main():
                 # reverse_timesteps = pipeline.scheduler.timesteps
                 # reverse_timestep = np.random.choice(reverse_timesteps)
 
-                t = timesteps.to(noise_scheduler.alphas_cumprod.device)
-                t_prev = noise_scheduler.previous_timestep(t).to(noise_scheduler.alphas_cumprod.device)
+                alpha_prod_t = noise_scheduler.alpha_prod_t
+                alpha_prod_t_prev = noise_scheduler.alpha_prod_t_prev
 
-                alpha_prod_t = noise_scheduler.alphas_cumprod[t]
-                alpha_prod_t_prev = noise_scheduler.alphas_cumprod[t_prev]
-                alpha_prod_t_prev[t_prev == 0] = noise_scheduler.one
-                # alpha_prod_t, alpha_prod_t_prev = noise_scheduler.get_alpha(timesteps)
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -1029,8 +1022,8 @@ def main():
                     
                     u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
                     
-                    Ju = A.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
-                    JTJu = A.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+                    Ju = F.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
+                    JTJu = F.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
 
                     TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
                     TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
