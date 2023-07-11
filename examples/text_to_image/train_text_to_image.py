@@ -48,10 +48,20 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-
 if is_wandb_available():
     import wandb
 
+########################################
+
+def ddim_step(unet, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+    epsilon = unet(x, t, y)
+    result = 1/(alpha_prod_t ** (0.5)) * x - (beta_prod_t ** (0.5)/alpha_prod_t ** (0.5) - beta_prod_t_prev ** (0.5)) * epsilon
+
+########################################
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
@@ -248,12 +258,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--image_column", 
+        type=str, 
+        default="image",
+        # nargs="+", 
+        help="The column of the dataset containing an image."
     )
     parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
+        # nargs="+",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -316,6 +331,9 @@ def parse_args():
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument(
+        "--lambda_pl", type=float, default=0.0, help="Hyperparameter, lambda value for pl_penalty"
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -448,7 +466,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=3000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -478,6 +496,12 @@ def parse_args():
         type=int,
         default=5,
         help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Split of the dataset.",
     )
     parser.add_argument(
         "--tracker_project_name",
@@ -722,6 +746,7 @@ def main():
             args.dataset_name,
             args.dataset_config_name,
             cache_dir=args.cache_dir,
+            use_auth_token=True
         )
     else:
         data_files = {}
@@ -737,7 +762,7 @@ def main():
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    column_names = dataset[args.split].column_names #"train"
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
@@ -796,9 +821,9 @@ def main():
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset[args.split] = dataset[args.split].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = dataset[args.split].with_transform(preprocess_train)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -908,8 +933,30 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
+
+        if accelerator.is_main_process:
+            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0):
+                if args.use_ema:
+                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    ema_unet.store(unet.parameters())
+                    ema_unet.copy_to(unet.parameters())
+                log_validation(
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    args,
+                    accelerator,
+                    weight_dtype,
+                    global_step,
+                )
+                if args.use_ema:
+                    # Switch back to the original UNet parameters.
+                    ema_unet.restore(unet.parameters())
+
         unet.train()
         train_loss = 0.0
+        train_loss_pl = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -961,8 +1008,30 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
+                # pipeline.scheduler.set_timesteps(num_inference_steps=20, device=accelerator.device)
+                # reverse_timesteps = pipeline.scheduler.timesteps
+                # reverse_timestep = np.random.choice(reverse_timesteps)
+
+                alpha_prod_t = noise_scheduler.alpha_prod_t
+                alpha_prod_t_prev = noise_scheduler.alpha_prod_t_prev
+
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                    ############################################
+                    
+                    u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
+                    
+                    Ju = F.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
+                    JTJu = F.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+
+                    TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                    TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+
+                    pl_penalty = args.lambda_pl * TrG2/ TrG ** 2
+
+                    loss += pl_penalty
+                    ############################################
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -982,6 +1051,9 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
+                avg_loss_pl = accelerator.gather(pl_penalty.repeat(args.train_batch_size)).mean()
+                train_loss_pl += avg_loss_pl.item() / args.gradient_accumulation_steps
+
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -997,7 +1069,10 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log({"train_loss_pl": train_loss_pl}, step=global_step)
+
                 train_loss = 0.0
+                train_loss_pl = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1025,31 +1100,12 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or epoch == 1):
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
-                log_validation(
-                    vae,
-                    text_encoder,
-                    tokenizer,
-                    unet,
-                    args,
-                    accelerator,
-                    weight_dtype,
-                    global_step,
-                )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

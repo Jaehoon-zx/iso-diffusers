@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=diffuser_1 # Submit a job named "example"
-#SBATCH --output=log_1.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
+#SBATCH --job-name=diffuser_2 # Submit a job named "example"
+#SBATCH --output=log_2.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
 
 #SBATCH --partition=a3000
 #SBATCH --gres=gpu:1          # Use 1 GPU
@@ -14,4 +14,4 @@ ml load cuda/11.3
 eval "$(conda shell.bash hook)"
 conda activate diffusers
 
-accelerate launch clip_guided_stable_diffusion.py
+accelerate launch stable_diffusion_2.py
