@@ -352,6 +352,11 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         current_alpha_t = alpha_prod_t / alpha_prod_t_prev
         current_beta_t = 1 - current_alpha_t
 
+        self.alpha_prod_t = alpha_prod_t
+        self.alpha_prod_t_prev = alpha_prod_t_prev
+        self.beta_prod_t = beta_prod_t
+        beta_prod_t_prev = beta_prod_t_prev
+
         # 2. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
         if self.config.prediction_type == "epsilon":
