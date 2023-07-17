@@ -54,15 +54,40 @@ from diffusers.utils.import_utils import is_xformers_available
 if is_wandb_available():
     import wandb
 
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
+torch.set_printoptions(precision=6)
+
 ########################################
 
-def ddim_step(unet, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+def add_dimensions(x, n_additional_dims):
+    for _ in range(n_additional_dims):
+        x = x.unsqueeze(-1)
+    return x
 
-    beta_prod_t = 1 - alpha_prod_t
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
+def ddim_step(model_pred, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+    #DDIM step for v_prediction
 
-    epsilon = unet(x, t, y)
-    result = 1/(alpha_prod_t ** (0.5)) * x - (beta_prod_t ** (0.5)/alpha_prod_t ** (0.5) - beta_prod_t_prev ** (0.5)) * epsilon
+    alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model_pred.device)
+    alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model_pred.device)
+
+    beta_prod_t = 1 - alpha_prod_t.to(model_pred.device)
+    beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model_pred.device)
+
+    pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * model_pred
+    pred_epsilon = (alpha_prod_t**0.5) * model_pred + (beta_prod_t**0.5) * x
+
+    std_dev = 0
+
+    # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev**2) ** (0.5) * pred_epsilon
+
+    # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+
+    return prev_sample
 
 ########################################
 
@@ -336,7 +361,7 @@ def parse_args():
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--lambda_pl", type=float, default=0.0, help="Hyperparameter, lambda value for pl_penalty"
+        "--lambda_pl", type=float, default=None, help="Hyperparameter, lambda value for pl_penalty"
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -469,7 +494,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=3000,
+        default=70000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -1022,22 +1047,24 @@ def main():
                 alpha_prod_t_prev = noise_scheduler.alphas_cumprod[t_prev]
                 alpha_prod_t_prev[t_prev == 0] = noise_scheduler.one
                 # alpha_prod_t, alpha_prod_t_prev = noise_scheduler.get_alpha(timesteps)
+
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                     ############################################
-                    
-                    u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
-                    
-                    Ju = A.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
-                    JTJu = A.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+                    if args.lambda_pl is not None:
+                        u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
+                        
+                        Ju = A.jvp(lambda x: ddim_step(model_pred, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
+                        JTJu = A.vjp(lambda x: ddim_step(model_pred, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
 
-                    TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
-                    TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                        TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                        TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
 
-                    pl_penalty = args.lambda_pl * TrG2/ TrG ** 2
+                        pl_penalty = args.lambda_pl * (TrG2 / TrG ** 2)
 
-                    loss += pl_penalty
+                        loss += pl_penalty
+
                     ############################################
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
@@ -1058,8 +1085,9 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                avg_loss_pl = accelerator.gather(pl_penalty.repeat(args.train_batch_size)).mean()
-                train_loss_pl += avg_loss_pl.item() / args.gradient_accumulation_steps
+                if args.lambda_pl is not None:
+                    avg_loss_pl = accelerator.gather(pl_penalty.repeat(args.train_batch_size)).mean()
+                    train_loss_pl += avg_loss_pl.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1076,7 +1104,8 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                accelerator.log({"train_loss_pl": train_loss_pl}, step=global_step)
+                if args.lambda_pl is not None:
+                    accelerator.log({"train_loss_pl": train_loss_pl}, step=global_step)
 
                 train_loss = 0.0
                 train_loss_pl = 0.0
@@ -1107,7 +1136,13 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            
+            if args.lambda_pl is not None:
+                logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                
+            else:
+                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

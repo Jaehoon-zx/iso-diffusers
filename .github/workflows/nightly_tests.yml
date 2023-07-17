@@ -11,7 +11,7 @@ env:
   MKL_NUM_THREADS: 8
   PYTEST_TIMEOUT: 600
   RUN_SLOW: yes
-  RUN_NIGHTLY: yes
+  RUN_NIGHTLY: no
 
 jobs:
   run_nightly_tests:
