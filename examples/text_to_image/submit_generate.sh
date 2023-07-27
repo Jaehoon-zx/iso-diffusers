@@ -1,9 +1,9 @@
 #!/bin/bash
 
-#SBATCH --job-name=diffuser_2 # Submit a job named "example"
-#SBATCH --output=log_2.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
+#SBATCH --job-name=diff_gen # Submit a job named "example"
+#SBATCH --output=log_generate.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
 
-#SBATCH --partition=a3000
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1          # Use 1 GPU
 #SBATCH --time=1-00:00:00        # d-hh:mm:ss 형식, 본인 job의 max time limit 지정
 #SBATCH --mem=50G              # cpu memory size

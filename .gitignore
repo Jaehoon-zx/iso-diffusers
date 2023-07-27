@@ -177,3 +177,4 @@ wandb
 
 *.txt
 output
+../*

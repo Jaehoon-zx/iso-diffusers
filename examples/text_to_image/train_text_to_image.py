@@ -31,6 +31,8 @@ import torch.nn.functional as F
 import torch.autograd.functional as A
 import torch.utils.checkpoint
 import transformers
+import tensorboard
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -48,17 +50,14 @@ import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from diffusers.utils import check_min_version, deprecate, is_wandb_available
+from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 
-if is_wandb_available():
-    import wandb
+from eval import compute_fid, compute_ppl
 
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)
-
-torch.set_printoptions(precision=6)
 
 ########################################
 
@@ -67,29 +66,50 @@ def add_dimensions(x, n_additional_dims):
         x = x.unsqueeze(-1)
     return x
 
-def ddim_step(model_pred, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+def ddim_step(model, x, t, y, alpha_prod_t, alpha_prod_t_prev):
     #DDIM step for v_prediction
 
-    alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model_pred.device)
-    alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model_pred.device)
+    alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model.device)
+    alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model.device)
 
-    beta_prod_t = 1 - alpha_prod_t.to(model_pred.device)
-    beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model_pred.device)
+    beta_prod_t = 1 - alpha_prod_t.to(model.device)
+    beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model.device)
+
+    model_pred = model(x, t, y).sample
 
     pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * model_pred
     pred_epsilon = (alpha_prod_t**0.5) * model_pred + (beta_prod_t**0.5) * x
 
-    std_dev = 0
+    std_dev = 0.0
 
     # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
     pred_sample_direction = (1 - alpha_prod_t_prev - std_dev**2) ** (0.5) * pred_epsilon
 
     # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+    noise = torch.randn_like(x)
+    prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction + std_dev * noise
 
     return prev_sample
 
 ########################################
+
+def ddim_step_direct(model, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+    #DDIM step for v_prediction
+
+    alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model.device)
+    alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model.device)
+
+    beta_prod_t = 1 - alpha_prod_t.to(model.device)
+    beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model.device)
+
+    model_pred = model(x, t, y).sample
+
+    pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * model_pred
+
+    return pred_original_sample
+
+########################################
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
@@ -186,7 +206,48 @@ More information on all the CLI arguments and the environment are available on y
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
 
+#######################################################################
+def compute_metrics(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, step, dataset):
+    text = dataset['train']['text']
+    logger.info("Computing metrics... ")
 
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        unet=accelerator.unwrap_model(unet),
+        safety_checker=None,
+        revision=args.revision,
+        torch_dtype=weight_dtype,
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    sampling_shape = (args.train_batch_size, 3, args.resolution, args.resolution)
+    fid = compute_fid(1000, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            accelerator.log({"fid": fid}, step=step)
+        else:
+            logger.warn(f"logging not implemented for {tracker.name}")
+        
+    logging.info('FID at step %d: %.6f' % (step, fid))
+    # logging.info('PPL (%d) at step %d: %.6f' % (i + 1, state['step'], ppl))
+    del pipeline
+    torch.cuda.empty_cache()
+    return None
+
+#######################################################################
 def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
@@ -215,22 +276,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     for i in range(len(args.validation_prompts)):
         with torch.autocast("cuda"):
             for j in range(args.prompts_reps):
-                image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+                image = pipeline(args.validation_prompts[i], num_inference_steps=20, height=args.resolution, width=args.resolution, num_images_per_prompt=1, generator=generator).images[0]
                 images.append(image)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
-                        for i, image in enumerate(images)
-                    ]
-                }
-            )
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
@@ -238,7 +290,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     torch.cuda.empty_cache()
 
     return images
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -314,6 +365,12 @@ def parse_args():
         default=None,
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
+        "--fid_stats_path",
+        type=str,
+        default="assets/stats/ffhq.npz",
+        help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
         "--prompts_reps",
@@ -494,7 +551,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=70000,
+        default=10000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -524,6 +581,18 @@ def parse_args():
         type=int,
         default=5,
         help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=1000,
+        help="Number of inference steps of reverse solver.",
+    )
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=1000,
+        help="Run validation every X steps.",
     )
     parser.add_argument(
         "--split",
@@ -612,6 +681,7 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -929,6 +999,7 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
+    pl_step = 0
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
@@ -960,14 +1031,40 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    pl_per_timestep = {}
+    for i in range(noise_scheduler.config.num_train_timesteps):
+        pl_per_timestep[i] = []
+
     for epoch in range(first_epoch, args.num_train_epochs):
 
-        if accelerator.is_main_process:
-            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0):
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
+        # if accelerator.is_main_process:
+        #     if args.validation_prompts is not None and (epoch % args.validation_epochs == 0):
+        #         if args.use_ema:
+        #             # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+        #             ema_unet.store(unet.parameters())
+        #             ema_unet.copy_to(unet.parameters())
+        #         log_validation(
+        #             vae,
+        #             text_encoder,
+        #             tokenizer,
+        #             unet,
+        #             args,
+        #             accelerator,
+        #             weight_dtype,
+        #             global_step,
+        #         )
+        #         if args.use_ema:
+        #             # Switch back to the original UNet parameters.
+        #             ema_unet.restore(unet.parameters())
+
+        unet.train()
+        train_loss = 0.0
+        train_loss_pl = 0.0
+        
+
+        for step, batch in enumerate(train_dataloader):
+
+            if args.validation_prompts is not None and (step % args.validation_steps == 0):
                 log_validation(
                     vae,
                     text_encoder,
@@ -978,14 +1075,17 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
+                compute_metrics(
+                    vae, 
+                    text_encoder, 
+                    tokenizer, 
+                    unet, 
+                    args, 
+                    accelerator, 
+                    weight_dtype, 
+                    global_step, 
+                    dataset)
 
-        unet.train()
-        train_loss = 0.0
-        train_loss_pl = 0.0
-        for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -1007,6 +1107,12 @@ def main():
                 if args.input_perturbation:
                     new_noise = noise + args.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
+
+                # noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps)
+                # timesteps_ind = torch.randint(0, args.num_inference_steps, (bsz,))
+                # timesteps = noise_scheduler.timesteps[timesteps_ind].to(latents.device)
+                # timesteps = timesteps.long()
+
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
@@ -1035,10 +1141,15 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                cond = True
 
-                # pipeline.scheduler.set_timesteps(num_inference_steps=20, device=accelerator.device)
+                # pipeline.scheduler.set_timesteps(num_inference_steps=50, device=accelerator.device)
                 # reverse_timesteps = pipeline.scheduler.timesteps
                 # reverse_timestep = np.random.choice(reverse_timesteps)
+
+                ############################################
+                noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
+                ############################################
 
                 t = timesteps.to(noise_scheduler.alphas_cumprod.device)
                 t_prev = noise_scheduler.previous_timestep(t).to(noise_scheduler.alphas_cumprod.device)
@@ -1046,24 +1157,50 @@ def main():
                 alpha_prod_t = noise_scheduler.alphas_cumprod[t]
                 alpha_prod_t_prev = noise_scheduler.alphas_cumprod[t_prev]
                 alpha_prod_t_prev[t_prev == 0] = noise_scheduler.one
-                # alpha_prod_t, alpha_prod_t_prev = noise_scheduler.get_alpha(timesteps)
+                
+                ############################################
+                # cond = (timesteps % (1000 // args.num_inference_steps) == 0) and t_prev >= 0
+                cond = t_prev >= 0
+                ############################################
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                     ############################################
-                    if args.lambda_pl is not None:
+                    if args.lambda_pl is not None and cond:
                         u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
                         
-                        Ju = A.jvp(lambda x: ddim_step(model_pred, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
-                        JTJu = A.vjp(lambda x: ddim_step(model_pred, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+                        # Ju = A.jvp(lambda x: ddim_step_direct(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
+                        # JTJu = A.vjp(lambda x: ddim_step_direct(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+
+                        Ju = A.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
+                        JTJu = A.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
 
                         TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
                         TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
 
                         pl_penalty = args.lambda_pl * (TrG2 / TrG ** 2)
+                        # pl_penalty = args.lambda_pl * TrG
 
                         loss += pl_penalty
+                    else:
+                        pl_penalty = 0 * loss
+
+                    # pl_per_timestep[t.item()].append(pl_penalty)
+                    
+                    # if (step % args.validation_steps == 0):
+                    #     avgpl_per_timestep = {}
+                    #     for i in range(noise_scheduler.config.num_train_timesteps):
+                    #         if len(pl_per_timestep[i]) != 0:
+                    #             avgpl_per_timestep[i] = sum(pl_per_timestep[i])/ float(len(pl_per_timestep[i]))
+                    #         else:
+                    #             avgpl_per_timestep[i] = 0
+
+                    #     for tracker in accelerator.trackers:
+                    #         if tracker.name == "tensorboard":
+                    #             pass
+                                # print(avgpl_per_timestep)
+                                # tensorboard.summary.histogram("histogram of average pl_loss per timestep", avgpl_per_timestep, step=step)
 
                     ############################################
                 else:
@@ -1097,6 +1234,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
+
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -1104,8 +1242,9 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                if args.lambda_pl is not None:
-                    accelerator.log({"train_loss_pl": train_loss_pl}, step=global_step)
+                if args.lambda_pl is not None and cond:
+                    accelerator.log({"train_loss_pl": train_loss_pl}, step=pl_step)
+                    pl_step += 1
 
                 train_loss = 0.0
                 train_loss_pl = 0.0
@@ -1135,10 +1274,9 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-
             
             if args.lambda_pl is not None:
-                logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"timesteps": timesteps.detach().item(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 
             else:
                 logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
