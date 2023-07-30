@@ -35,6 +35,8 @@ def get_activations(dl, model, batch_size, device, max_samples, include_step=Tru
 
 
             with torch.no_grad():
+                batch = (batch / 2. + .5).clip(0., 1.)
+                batch = (batch * 255.).to(torch.uint8)
                 pred = model(batch, return_features=True).unsqueeze(-1).unsqueeze(-1)
 
             pred = pred.squeeze(3).squeeze(2).cpu().numpy()
@@ -61,6 +63,8 @@ def get_activations(dl, model, batch_size, device, max_samples, include_step=Tru
 
 
             with torch.no_grad():
+                batch = (batch / 2. + .5).clip(0., 1.)
+                batch = (batch * 255.).to(torch.uint8)
                 pred = model(batch, return_features=True).unsqueeze(-1).unsqueeze(-1)
 
             pred = pred.squeeze(3).squeeze(2).cpu().numpy()
@@ -70,12 +74,9 @@ def get_activations(dl, model, batch_size, device, max_samples, include_step=Tru
                 print('Max of %d samples reached.' % max_samples)
                 break
 
-    pred_arr = np.concatenate(pred_arr, axis=0)
-    if max_samples is not None:
-        pred_arr = pred_arr[:max_samples]
-
-    return pred_arr
-
+        pred_arr = np.concatenate(pred_arr, axis=0)
+        if max_samples is not None:
+            pred_arr = pred_arr[:max_samples]
 
     return pred_arr
 
@@ -181,7 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('--path', type=str, default="Ryan-sjtu/ffhq512-caption")
     parser.add_argument('--pretrained_model_name_or_path', type=str, default="stabilityai/stable-diffusion-2")
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--resolution', type=int, default=512)
+    parser.add_argument('--resolution', type=int, default=256)
     parser.add_argument('--center_crop', type=bool, default=True)
     parser.add_argument('--random_flip', type=bool, default=True)
     parser.add_argument('--fid_dir', type=str, default='./')

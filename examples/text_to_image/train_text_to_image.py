@@ -231,17 +231,20 @@ def compute_metrics(vae, text_encoder, tokenizer, unet, args, accelerator, weigh
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    sampling_shape = (args.train_batch_size, 3, args.resolution, args.resolution)
+    batch_size = 8
+    sampling_shape = (batch_size, 3, args.resolution, args.resolution)
+    latent_sampling_shape = (batch_size, unet.in_channels, unet.sample_size, unet.sample_size)
+    ppl = compute_ppl(n_samples=1000, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
     fid = compute_fid(1000, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
-
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             accelerator.log({"fid": fid}, step=step)
+            accelerator.log({"ppl": ppl}, step=step)
         else:
             logger.warn(f"logging not implemented for {tracker.name}")
         
     logging.info('FID at step %d: %.6f' % (step, fid))
+    logging.info('PPL at step %d: %.6f' % (step, ppl))
     # logging.info('PPL (%d) at step %d: %.6f' % (i + 1, state['step'], ppl))
     del pipeline
     torch.cuda.empty_cache()
@@ -506,6 +509,7 @@ def parse_args():
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument("--metrics", type=bool, default=False, help="Compute metrics.")
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -1063,7 +1067,7 @@ def main():
         
 
         for step, batch in enumerate(train_dataloader):
-
+            latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
             if args.validation_prompts is not None and (step % args.validation_steps == 0):
                 log_validation(
                     vae,
@@ -1075,16 +1079,17 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                compute_metrics(
-                    vae, 
-                    text_encoder, 
-                    tokenizer, 
-                    unet, 
-                    args, 
-                    accelerator, 
-                    weight_dtype, 
-                    global_step, 
-                    dataset)
+                if args.metrics:
+                    compute_metrics(
+                        vae, 
+                        text_encoder, 
+                        tokenizer, 
+                        unet, 
+                        args, 
+                        accelerator, 
+                        weight_dtype, 
+                        global_step, 
+                        dataset)
 
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -1141,14 +1146,13 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                cond = True
 
                 # pipeline.scheduler.set_timesteps(num_inference_steps=50, device=accelerator.device)
                 # reverse_timesteps = pipeline.scheduler.timesteps
                 # reverse_timestep = np.random.choice(reverse_timesteps)
 
                 ############################################
-                noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
+                # noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
                 ############################################
 
                 t = timesteps.to(noise_scheduler.alphas_cumprod.device)
@@ -1159,15 +1163,15 @@ def main():
                 alpha_prod_t_prev[t_prev == 0] = noise_scheduler.one
                 
                 ############################################
-                # cond = (timesteps % (1000 // args.num_inference_steps) == 0) and t_prev >= 0
-                cond = t_prev >= 0
+                # cond = (timesteps % (1000 // args.num_inference_steps) == 0) and t_prev > 0
+                cond = True
                 ############################################
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                     ############################################
-                    if args.lambda_pl is not None and cond:
+                    if args.lambda_pl > 0 and cond:
                         u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
                         
                         # Ju = A.jvp(lambda x: ddim_step_direct(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
@@ -1222,7 +1226,7 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                if args.lambda_pl is not None:
+                if args.lambda_pl > 0:
                     avg_loss_pl = accelerator.gather(pl_penalty.repeat(args.train_batch_size)).mean()
                     train_loss_pl += avg_loss_pl.item() / args.gradient_accumulation_steps
 
@@ -1275,7 +1279,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
             
-            if args.lambda_pl is not None:
+            if args.lambda_pl > 0:
                 logs = {"timesteps": timesteps.detach().item(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 
             else:

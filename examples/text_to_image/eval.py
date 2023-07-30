@@ -23,6 +23,33 @@ def add_dimensions(x, n_additional_dims):
         x = x.unsqueeze(-1)
     return x
 
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    """helper function to spherically interpolate two arrays v1 v2"""
+
+    inputs_are_torch = isinstance(v0, torch.Tensor)
+    if inputs_are_torch:
+        input_device = v0.device
+        v0 = v0.cpu().numpy()
+        v1 = v1.cpu().numpy()
+        t = t.cpu().numpy()
+
+    dot = np.sum(v0 * v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
+    if np.abs(dot) > DOT_THRESHOLD:
+        v2 = (1 - t) * v0 + t * v1
+    else:
+        theta_0 = np.arccos(dot)
+        sin_theta_0 = np.sin(theta_0)
+        theta_t = theta_0 * t
+        sin_theta_t = np.sin(theta_t)
+        s0 = np.sin(theta_0 - theta_t) / sin_theta_0
+        s1 = sin_theta_t / sin_theta_0
+        v2 = s0 * v0 + s1 * v1
+
+    if inputs_are_torch:
+        v2 = torch.from_numpy(v2).to(input_device)
+
+    return v2
+
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.
     The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
@@ -88,7 +115,6 @@ def compute_fid(n_samples, n_gpus, sampling_shape, sampler, gen, stats_path, dev
         with torch.autocast("cuda"):
             for _ in range(num_sampling_rounds):
                 x = tf_toTensor(sampler(text[torch.randint(0,len(text),[1])], num_inference_steps=20, generator=gen).images[0])
-                x = (x / 2. + .5).clip(0., 1.)
                 x = (x * 255.).to(torch.uint8)
                 yield x
 
@@ -117,58 +143,73 @@ def compute_fid(n_samples, n_gpus, sampling_shape, sampler, gen, stats_path, dev
 
 ######################################################################
 
-def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, vgg_model, device, n_classes=None):
+def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=None, n_classes=None):
     num_samples_per_gpu = int(np.ceil(n_samples / n_gpus))
     epsilon = 1e-2
+    tf_toTensor = ToTensor()
+    if type(text) is list:
+        text = np.asarray(text)
 
+    def embed_text(text, text_encoder, tokenizer):
+        # print(tokenizer)
+        text_input = tokenizer(
+            list(text),
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            text_input_ids = text_input.input_ids.to(device=device)
+            # print("input id",text_input_ids.dtype)
+            # print("encoder",text_encoder.dtype)
+            # print("embeddings",text_encoder.text_model.embeddings(text_input_ids).dtype)
+            # print("text model",text_encoder.text_model.dtype)
+            embed = text_encoder(text_input_ids)[0] # Here!
+        return embed
     def generator(num_samples):
         num_sampling_rounds = int(
             np.ceil(num_samples / sampling_shape[0]))
         for n in range(num_sampling_rounds):
-            z0 = torch.randn(sampling_shape, device=device)
-            z1 = torch.randn(sampling_shape, device=device)
-            t = torch.randn(sampling_shape[0], device=device)
+            z0 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
+            z1 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
+            y0 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
+            y1 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
+            # print(y0.shape)
+            # print(y1.shape)
+            # y0 = embed_text(text[torch.randint(0,len(text),[sampling_shape[0]])], sampler.text_encoder, sampler.tokenizer)
+            # y1 = embed_text(text[torch.randint(0,len(text),[sampling_shape[0]])], sampler.text_encoder, sampler.tokenizer)
+                      
+            t = torch.rand(sampling_shape[0], device=device, dtype=sampler.text_encoder.dtype)
             t = add_dimensions(t, 3)
 
-            zt0 = z0.lerp(z1, t)
-            zt1 = z0.lerp(z1, t + epsilon)
+            zt0 = slerp(t, z0, z1)
+            zt1 = slerp(t + epsilon, z0, z1)
+            yt0 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t).squeeze(1)
+            yt1 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t + epsilon).squeeze(1)
 
-            if n_classes is not None:
-                y = torch.randint(n_classes, size=(
-                    sampling_shape[0],), dtype=torch.int32, device=device)
-                x0, _ = sampler(zt0, y=y)
-                x1, _ = sampler(zt1, y=y)
-
-            else:
-                x0, _ = sampler(zt0)
-                x1, _ = sampler(zt1)
-
+            # print(zt0.shape)
+            # print(zt1.shape)
+            # print(zt0.dtype, yt0.dtype)
+            # print(sampler.dtype)
+            print(sampler.vae.post_quant_conv.weight.dtype)
+            x0 = tf_toTensor(sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=20, generator=gen)["images"][0])
+            x1 = tf_toTensor(sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=20, generator=gen)["images"][0])
+            x0 = (x0 * 2 - 1).clip(-1., 1.)
+            x1 = (x1 * 2 - 1).clip(-1., 1.)
             imgs = (x0, x1)
-
-            for x in imgs:
-                x = (x / 2. + .5).clip(0., 1.)
-                x = (x * 255.).to(torch.uint8)
             
             return imgs
 
     def calculate_lpips(x0, x1):
-        # vgg16_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/vgg16.pkl'
-        # vgg16 = metric_utils.get_feature_detector(vgg16_url, num_gpus=opts.num_gpus, rank=opts.rank, verbose=opts.progress.verbose)
-
-        # lpips_t0 = vgg16(x0, resize_images=False, return_lpips=True)
-        # lpips_t0 = vgg16(x1, resize_images=False, return_lpips=True)
-
-        loss_fn_alex = lpips.LPIPS(net = 'alex', verbose = False)
-
-        dist = loss_fn_alex(x0.to('cpu'), x1.to('cpu')).square().sum((1,2,3)) / epsilon ** 2
+        loss_fn_alex = lpips.LPIPS(net = 'alex', verbose = False).to(device)
+        dist = loss_fn_alex(x0, x1).square().sum((1,2,3)) / epsilon ** 2
         return dist
 
     dist_list = []
     for i in range(0, n_samples, sampling_shape[0]):
         x0, x1 = generator(num_samples_per_gpu)
-        print(x0,x1)
         dist = calculate_lpips(x0, x1)
-        print(dist)
         dist_list.append(dist)
 
     # Compute PPL.
