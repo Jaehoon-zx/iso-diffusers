@@ -20,9 +20,9 @@ from stable_diffusion_videos import StableDiffusionWalkPipeline
 # ).to("cuda")
 
 # Load from my checkpoint/unet
-model_path = "output/sd2-ffhq512-32"
-model_name = "stabilityai/stable-diffusion-2"
-unet = UNet2DConditionModel.from_pretrained(model_path + "/checkpoint-20000/unet")
+model_path = "output/sd2-ffhq512-43"
+model_name = "lambdalabs/miniSD-diffusers"
+unet = UNet2DConditionModel.from_pretrained(model_path + "/checkpoint-320000/unet")
 
 pipe = DiffusionPipeline.from_pretrained(
     model_name, 
@@ -37,7 +37,7 @@ frame_filepaths = pipe.walk(
     #          "a professional photography of a cowboy riding a horse",
     # ],
     prompts=["",
-             "a photography of a little girl wearing pink dress smiling",
+            "a photography of a little girl wearing pink dress smiling",
             "a photography of a woman smiling with her hands on her chin",
             "a photography of a man with glasses and a microphone in his hand",  
     ],
@@ -48,5 +48,5 @@ frame_filepaths = pipe.walk(
     height=256,
     width=256,
     guidance_scale=8.5,
-    num_inference_steps=50,
+    num_inference_steps=20,
 )

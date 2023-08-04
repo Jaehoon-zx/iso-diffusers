@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=diff_40 # Submit a job named "example"
-#SBATCH --output=log_40.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
+#SBATCH --job-name=diff_58 # Submit a job named "example"
+#SBATCH --output=logs/log_58.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
 
-#SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:1          # Use 1 GPU
+#SBATCH --partition=a3000
+#SBATCH --gres=gpu:1          # Use 1 GPU
 #SBATCH --time=2-00:00:00        # d-hh:mm:ss 형식, 본인 job의 max time limit 지정
 #SBATCH --mem=50G              # cpu memory size
 #SBATCH --cpus-per-task=8       # cpu 개수
@@ -20,7 +20,7 @@ conda activate diffusers
 #"lambdalabs/pokemon-blip-captions"
 #"facebook/winoground" 
 
-export MODEL_NAME="lambdalabs/sd-image-variations-diffusers"
+export MODEL_NAME="lambdalabs/miniSD-diffusers"
 export DATASET_NAME="Ryan-sjtu/ffhq512-caption" 
 
 accelerate launch --mixed_precision="fp16" train_text_to_image.py \
@@ -35,14 +35,15 @@ accelerate launch --mixed_precision="fp16" train_text_to_image.py \
   --learning_rate=1e-05 \
   --max_grad_norm=1 \
   --lr_scheduler="constant" --lr_warmup_steps=0 \
-  --output_dir="output/sd2-ffhq512-40" \
+  --output_dir="output/sd2-ffhq512-58" \
   --validation_epochs=1 \
   --validation_steps=5000 \
-  --validation_prompts "a photography of a baby in a blue blanket with a stuffed animal" "a photography of a little girl with a toothbrush in her mouth" \
-  --prompts_reps=2 \
+  --validation_prompts "a photography of a man wearing blue shirt and a tie" "a photography of a woman smiling with her hands on her chin" \
+  --prompts_reps=4 \
   --image_column="image" \
   --caption_column="text" \
   --split="train" \
-  --lambda_pl=1e-5 \
-  --num_inference_steps=10 \
-
+  --lambda_pl=0 \
+  --num_inference_steps=20 \
+  --ppl \
+  --fid \

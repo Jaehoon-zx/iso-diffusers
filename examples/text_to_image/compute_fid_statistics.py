@@ -10,18 +10,18 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from accelerate.state import AcceleratorState
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
-
+from tqdm import tqdm
 # from stylegan3.dataset import ImageFolderDataset
 from dnnlib.util import open_url
 import torch_utils
 
-def get_activations(dl, model, batch_size, device, max_samples, include_step=True):
+def get_activations(dl, model, batch_size, device, max_samples, dl_include_step=True):
     pred_arr = []
     total_processed = 0
 
     print('Starting to sample.')
-    if include_step:
-        for step, batch in enumerate(dl):
+    if dl_include_step:
+        for step, batch in tqdm(enumerate(dl)):
             batch = batch["pixel_values"].to(torch.float16)
             # ignore labels
             if isinstance(batch, list):
@@ -60,11 +60,7 @@ def get_activations(dl, model, batch_size, device, max_samples, include_step=Tru
                 batch = batch.repeat(1, 3, 1, 1)
             elif len(batch.shape) == 3:  # if image is gray scale
                 batch = batch.unsqueeze(1).repeat(1, 3, 1, 1)
-
-
             with torch.no_grad():
-                batch = (batch / 2. + .5).clip(0., 1.)
-                batch = (batch * 255.).to(torch.uint8)
                 pred = model(batch, return_features=True).unsqueeze(-1).unsqueeze(-1)
 
             pred = pred.squeeze(3).squeeze(2).cpu().numpy()
@@ -180,17 +176,17 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--path', type=str, default="Ryan-sjtu/ffhq512-caption")
-    parser.add_argument('--pretrained_model_name_or_path', type=str, default="stabilityai/stable-diffusion-2")
+    parser.add_argument('--pretrained_model_name_or_path', type=str, default="lambdalabs/miniSD-diffusers")
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--resolution', type=int, default=256)
     parser.add_argument('--center_crop', type=bool, default=True)
     parser.add_argument('--random_flip', type=bool, default=True)
     parser.add_argument('--fid_dir', type=str, default='./')
     parser.add_argument('--split', type=str, default='train')
-    parser.add_argument('--file', type=str, default="ffhq.npz")
+    parser.add_argument('--file', type=str, default="assets/stats/ffhq_new.npz")
     parser.add_argument('--max_samples', type=int, default=None)
     
-    args = parser.parse_args("")
+    args = parser.parse_args()
 
     torch.manual_seed(0)
     np.random.seed(0)

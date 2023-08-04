@@ -53,7 +53,7 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 
-from eval import compute_fid, compute_ppl
+from eval import compute_fid, compute_ppl, compute_ppl_lerp, add_dimensions
 
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -61,13 +61,36 @@ torch.backends.cuda.enable_math_sdp(True)
 
 ########################################
 
-def add_dimensions(x, n_additional_dims):
-    for _ in range(n_additional_dims):
-        x = x.unsqueeze(-1)
-    return x
+# def ddim_step(model, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+#     #DDIM step for v_prediction
+
+#     alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model.device)
+#     alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model.device)
+
+#     beta_prod_t = 1 - alpha_prod_t.to(model.device)
+#     beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model.device)
+
+#     model_pred = model(x, t, y).sample
+
+#     pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * model_pred
+#     pred_epsilon = (alpha_prod_t**0.5) * model_pred + (beta_prod_t**0.5) * x
+
+#     std_dev = 0.0
+
+#     # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+#     pred_sample_direction = (1 - alpha_prod_t_prev - std_dev**2) ** (0.5) * pred_epsilon
+
+#     # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+#     noise = torch.randn_like(x)
+#     prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction + std_dev * noise
+
+#     return prev_sample
 
 def ddim_step(model, x, t, y, alpha_prod_t, alpha_prod_t_prev):
+    """
     #DDIM step for v_prediction
+    """
+    # prompt_embeds = pipeline._encode_prompt(prompt=y, device=model.device, num_images_per_prompt=1, do_classifier_free_guidance=True)
 
     alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model.device)
     alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model.device)
@@ -75,13 +98,20 @@ def ddim_step(model, x, t, y, alpha_prod_t, alpha_prod_t_prev):
     beta_prod_t = 1 - alpha_prod_t.to(model.device)
     beta_prod_t_prev = 1 - alpha_prod_t_prev.to(model.device)
 
+    # # Classifier free guidance
+    # x = torch.cat([x] * 2) 
     model_pred = model(x, t, y).sample
 
+    # guidance_scale = 7.5
+    # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+    # noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+    
+
+    ###DDIM
     pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * model_pred
     pred_epsilon = (alpha_prod_t**0.5) * model_pred + (beta_prod_t**0.5) * x
 
     std_dev = 0.0
-
     # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
     pred_sample_direction = (1 - alpha_prod_t_prev - std_dev**2) ** (0.5) * pred_epsilon
 
@@ -209,7 +239,7 @@ More information on all the CLI arguments and the environment are available on y
 #######################################################################
 def compute_metrics(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, step, dataset):
     text = dataset['train']['text']
-    logger.info("Computing metrics... ")
+    logger.info("Calculating Metrics... ")
 
     pipeline = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -231,21 +261,32 @@ def compute_metrics(vae, text_encoder, tokenizer, unet, args, accelerator, weigh
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-    batch_size = 8
+
+    batch_size = 16
     sampling_shape = (batch_size, 3, args.resolution, args.resolution)
-    latent_sampling_shape = (batch_size, unet.in_channels, unet.sample_size, unet.sample_size)
-    ppl = compute_ppl(n_samples=1000, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
-    fid = compute_fid(1000, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
+    # latent_sampling_shape = (batch_size, unet.in_channels, args.resolution // 8, args.resolution //8) # unet channel must be modified
+    latent_sampling_shape = (batch_size, unet.config.in_channels, unet.config.sample_size, unet.config.sample_size) # unet channel must be modified
+    if args.ppl:
+        print("Calculating PPL")
+        ppl = compute_ppl(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+    if args.fid:
+        print("Calculating FID")
+        fid = compute_fid(1000, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
+    # print("Calculating PPL_lerp")
+    # ppl_lerp = compute_ppl_lerp(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
-            accelerator.log({"fid": fid}, step=step)
             accelerator.log({"ppl": ppl}, step=step)
+            accelerator.log({"fid": fid}, step=step)
+            # accelerator.log({"ppl_lerp": ppl_lerp}, step=step)
         else:
             logger.warn(f"logging not implemented for {tracker.name}")
-        
-    logging.info('FID at step %d: %.6f' % (step, fid))
+    
     logging.info('PPL at step %d: %.6f' % (step, ppl))
-    # logging.info('PPL (%d) at step %d: %.6f' % (i + 1, state['step'], ppl))
+    logging.info('FID at step %d: %.6f' % (step, fid))
+    # logging.info('PPL_lerp at step %d: %.6f' % (step, ppl_lerp))
+
     del pipeline
     torch.cuda.empty_cache()
     return None
@@ -372,7 +413,7 @@ def parse_args():
     parser.add_argument(
         "--fid_stats_path",
         type=str,
-        default="assets/stats/ffhq.npz",
+        default="assets/stats/ffhq_256.npz",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -509,7 +550,9 @@ def parse_args():
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument("--metrics", type=bool, default=False, help="Compute metrics.")
+    parser.add_argument("--fid", action="store_true", help="Compute metrics.")
+    parser.add_argument("--ppl", action="store_true", help="Compute metrics.")
+
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -1065,21 +1108,9 @@ def main():
         train_loss = 0.0
         train_loss_pl = 0.0
         
-
         for step, batch in enumerate(train_dataloader):
-            latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
             if args.validation_prompts is not None and (step % args.validation_steps == 0):
-                log_validation(
-                    vae,
-                    text_encoder,
-                    tokenizer,
-                    unet,
-                    args,
-                    accelerator,
-                    weight_dtype,
-                    global_step,
-                )
-                if args.metrics:
+                if args.fid or args.ppl:
                     compute_metrics(
                         vae, 
                         text_encoder, 
@@ -1090,7 +1121,19 @@ def main():
                         weight_dtype, 
                         global_step, 
                         dataset)
-
+                    
+                log_validation(
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    args,
+                    accelerator,
+                    weight_dtype,
+                    global_step,
+                )
+                
+            latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -1147,12 +1190,8 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                # pipeline.scheduler.set_timesteps(num_inference_steps=50, device=accelerator.device)
-                # reverse_timesteps = pipeline.scheduler.timesteps
-                # reverse_timestep = np.random.choice(reverse_timesteps)
-
                 ############################################
-                # noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
+                noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
                 ############################################
 
                 t = timesteps.to(noise_scheduler.alphas_cumprod.device)
@@ -1163,8 +1202,8 @@ def main():
                 alpha_prod_t_prev[t_prev == 0] = noise_scheduler.one
                 
                 ############################################
-                # cond = (timesteps % (1000 // args.num_inference_steps) == 0) and t_prev > 0
-                cond = True
+                cond = (timesteps % (1000 // args.num_inference_steps) == 0) and t_prev > 0 # both are tensor type, so we should use "&" operation instead of "and".
+                # cond = True
                 ############################################
 
                 if args.snr_gamma is None:
@@ -1172,13 +1211,13 @@ def main():
 
                     ############################################
                     if args.lambda_pl > 0 and cond:
-                        u = torch.randn_like(noisy_latents, device=accelerator.device) / (noisy_latents.shape[1] * noisy_latents.shape[2] * noisy_latents.shape[3] )
+                        u = torch.randn_like(encoder_hidden_states, device=accelerator.device)
                         
                         # Ju = A.jvp(lambda x: ddim_step_direct(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
                         # JTJu = A.vjp(lambda x: ddim_step_direct(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
 
-                        Ju = A.jvp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, u, create_graph=True)[1]
-                        JTJu = A.vjp(lambda x: ddim_step(unet, x, timesteps, encoder_hidden_states, alpha_prod_t, alpha_prod_t_prev), noisy_latents, Ju, create_graph=True)[1]
+                        Ju = A.jvp(lambda y: ddim_step(unet, noisy_latents, timesteps, y, alpha_prod_t, alpha_prod_t_prev), encoder_hidden_states, u, create_graph=True)[1]
+                        JTJu = A.vjp(lambda y: ddim_step(unet, noisy_latents, timesteps, y, alpha_prod_t, alpha_prod_t_prev), encoder_hidden_states, Ju, create_graph=True)[1]
 
                         TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
                         TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
@@ -1280,8 +1319,8 @@ def main():
                         logger.info(f"Saved state to {save_path}")
             
             if args.lambda_pl > 0:
-                logs = {"timesteps": timesteps.detach().item(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-                
+                # logs = {"timesteps": timesteps.detach().item(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             else:
                 logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
 
