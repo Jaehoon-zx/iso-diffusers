@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=diff_54 # Submit a job named "example"
-#SBATCH --output=logs/log_54.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
+#SBATCH --job-name=diff_65 # Submit a job named "example"
+#SBATCH --output=logs/log_65.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
 
 #SBATCH --partition=a3000
 #SBATCH --gres=gpu:1          # Use 1 GPU
@@ -14,13 +14,7 @@ ml load cuda/11.3
 eval "$(conda shell.bash hook)"
 conda activate diffusers
 
-#"CompVis/stable-diffusion-v1-4"
-#"stabilityai/stable-diffusion-2"
-
-#"lambdalabs/pokemon-blip-captions"
-#"facebook/winoground" 
-
-export MODEL_NAME="lambdalabs/miniSD-diffusers"
+export MODEL_NAME="segmind/tiny-sd"
 export DATASET_NAME="Ryan-sjtu/ffhq512-caption" 
 
 accelerate launch --mixed_precision="fp16" train_text_to_image.py \
@@ -34,16 +28,18 @@ accelerate launch --mixed_precision="fp16" train_text_to_image.py \
   --max_train_steps=140000 \
   --learning_rate=1e-05 \
   --max_grad_norm=1 \
-  --lr_scheduler="constant" --lr_warmup_steps=0 \
-  --output_dir="output/sd2-ffhq512-54" \
+  --lr_scheduler="constant" \
+  --lr_warmup_steps=0 \
+  --output_dir="output/sd2-ffhq512-65" \
   --validation_epochs=1 \
   --validation_steps=5000 \
-  --validation_prompts "a photography of a man wearing black shirt and a tie" "a photography of a woman smiling with her hands on her chin" \
+  --validation_prompts "there is a woman with long hair posing for a picture" "there is a baby sitting in the grass chewing on a toy" \
   --prompts_reps=4 \
   --image_column="image" \
-  --caption_column="text" \
+  --caption_column="image_caption" \
   --split="train" \
   --lambda_pl=1 \
   --num_inference_steps=20 \
-  --ppl \
-  --fid \
+  # --dists \
+  # --ppl \
+  # --fid \

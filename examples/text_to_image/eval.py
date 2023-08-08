@@ -166,19 +166,6 @@ def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=No
     if type(text) is list:
         text = np.asarray(text)
 
-    # def embed_text(text, text_encoder, tokenizer):
-    #     # print(tokenizer)
-    #     text_input = tokenizer(
-    #         list(text),
-    #         padding="max_length",
-    #         max_length=tokenizer.model_max_length,
-    #         truncation=True,
-    #         return_tensors="pt",
-    #     )
-    #     with torch.no_grad():
-    #         text_input_ids = text_input.input_ids.to(device=device)
-    #         embed = text_encoder(text_input_ids)[0] # Here!
-    #     return embed
     def generator(sampling_shape):
         with torch.autocast("cuda"):
             with torch.no_grad():
@@ -195,13 +182,6 @@ def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=No
                 yt0 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t).squeeze(1)
                 yt1 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t + epsilon).squeeze(1)
 
-                # x0 = torch.tensor(sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=20, generator=gen, output_type='np.array').images)
-                # x1 = torch.tensor(sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=20, generator=gen, output_type='np.array').images)
-                # x0 = torch.permute(x0, (0, 3, 1, 2))
-                # x1 = torch.permute(x1, (0, 3, 1, 2))
-                # x0 = (x0 * 2 - 1).clip(-1., 1.).to(device)
-                # x1 = (x1 * 2 - 1).clip(-1., 1.).to(device)
-                # print(x0.max(), x0.min())
                 x0 = sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=20, generator=gen, output_type='pt').images
                 x1 = sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=20, generator=gen, output_type='pt').images
                 x0 = (x0 * 2 - 1).clip(-1., 1.)
@@ -231,7 +211,6 @@ def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=No
         dist_list.append(dist.detach().cpu())
 
     # Compute PPL.
-    # dist_list = torch.cat(dist_list)[:n_samples].cpu().detach().numpy()
     dist_list = np.array(dist_list)
     lo = np.percentile(dist_list, 1, interpolation='lower')
     hi = np.percentile(dist_list, 99, interpolation='higher')
@@ -239,90 +218,62 @@ def compute_ppl(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=No
 
     return float(ppl)
 
-#################################################################
 
-def compute_ppl_lerp(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=None, n_classes=None):
+def compute_distortion_per_timesteps(n_samples, n_gpus, sampling_shape, sampler, gen, device, text=None, n_classes=None):
     num_samples_per_gpu = int(np.ceil(n_samples / n_gpus))
-    epsilon = 1e-4
+    epsilon = 1e-3
     tf_toTensor = ToTensor()
     if type(text) is list:
         text = np.asarray(text)
 
-    def embed_text(text, text_encoder, tokenizer):
-        # print(tokenizer)
-        text_input = tokenizer(
-            list(text),
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        with torch.no_grad():
-            text_input_ids = text_input.input_ids.to(device=device)
-            # print("input id",text_input_ids.dtype)
-            # print("encoder",text_encoder.dtype)
-            # print("embeddings",text_encoder.text_model.embeddings(text_input_ids).dtype)
-            # print("text model",text_encoder.text_model.dtype)
-            embed = text_encoder(text_input_ids)[0] # Here!
-        return embed
-    def generator(sampling_shape):
-        z0 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
-        z1 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
-        y0 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
-        y1 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
-                    
-        t = torch.rand(sampling_shape[0], device=device, dtype=sampler.text_encoder.dtype)
-        t = add_dimensions(t, 3)
+    def generator(sampling_shape, interrupt_step):
+        with torch.autocast("cuda"):
+            with torch.no_grad():
+                z0 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
+                z1 = torch.randn(sampling_shape, device=device, dtype=sampler.text_encoder.dtype)
+                y0 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
+                y1 = sampler._encode_prompt(list(text[torch.randint(0,len(text),[sampling_shape[0]])]), device, 1, True)[:sampling_shape[0]]
+                            
+                t = torch.rand(sampling_shape[0], device=device, dtype=sampler.text_encoder.dtype)
+                t = add_dimensions(t, 3)
 
-        zt0 = torch.lerp(t, z0, z1)
-        zt1 = torch.lerp(t + epsilon, z0, z1)
-        yt0 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t).squeeze(1)
-        yt1 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t + epsilon).squeeze(1)
+                zt0 = slerp(t, z0, z1)
+                zt1 = slerp(t + epsilon, z0, z1)
+                yt0 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t).squeeze(1)
+                yt1 = torch.lerp(y0.unsqueeze(1), y1.unsqueeze(1), t).squeeze(1)
 
-        # x0 = torch.tensor(sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=20, generator=gen, output_type='np.array').images)
-        # x1 = torch.tensor(sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=20, generator=gen, output_type='np.array').images)
-        # x0 = torch.permute(x0, (0, 3, 1, 2))
-        # x1 = torch.permute(x1, (0, 3, 1, 2))
-
-        # x0 = (x0 * 2 - 1).clip(-1., 1.).to(device)
-        # x1 = (x1 * 2 - 1).clip(-1., 1.).to(device)
-
-        x0 = sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=20, generator=gen, output_type='pt').images
-        x1 = sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=20, generator=gen, output_type='pt').images
-        x0 = (x0 * 2 - 1).clip(-1., 1.)
-        x1 = (x1 * 2 - 1).clip(-1., 1.)
-        imgs = (x0, x1)
+                x0 = sampler(latents=zt0, prompt_embeds=yt0, num_inference_steps=50, generator=gen, output_type='latent', interrupt_step=interrupt_step).images
+                x1 = sampler(latents=zt1, prompt_embeds=yt1, num_inference_steps=50, generator=gen, output_type='latent', interrupt_step=interrupt_step).images
+                x0 = (x0 * 2 - 1).clip(-1., 1.)
+                x1 = (x1 * 2 - 1).clip(-1., 1.)
+                imgs = (x0, x1)
 
         return imgs
 
-    def calculate_lpips(x0, x1):
-        # loss_fn_alex = lpips.LPIPS(net = 'alex', verbose = False).to(device)
-        # dist = loss_fn_alex(x0, x1).square().sum((1,2,3)) / epsilon ** 2
-        # print(loss_fn_alex(x0, x1).shape)
-
-        # distance_measure = load_pkl('https://nvlabs-fi-cdn.nvidia.com/stylegan/networks/metrics/vgg16_zhang_perceptual.pkl')
-        # dist = distance_measure.get_output_for(x0, x1) * (1 / epsilon**2)
-
-        lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
-        dist = lpips(x0, x1) / epsilon ** 2
-
+    def calculate_l2(x0, x1):
+        dist = torch.sum((x0 - x1) ** 2, dim=(1,2,3))
         return dist
 
-    dist_list = []
-    for i in tqdm(range(0, n_samples, sampling_shape[0])):
-        x0, x1 = generator(sampling_shape)
-        dist = calculate_lpips(x0, x1)
-        dist_list.append(dist.detach().cpu())
+    dist_list_per_timesteps = []
+    for j in range(1,51):
+        print(f"Calculating {j}th timestep's distortion.")
+        dist_list = []
+        for i in range(0, n_samples, sampling_shape[0]):
+            x0, x1 = generator(sampling_shape, interrupt_step=j)
+            dist = calculate_l2(x0, x1)
+            dist_list.append(dist.detach().cpu())
 
-    # Compute PPL.
-    # dist_list = torch.cat(dist_list)[:n_samples].cpu().detach().numpy()
-    dist_list = np.array(dist_list)
-    lo = np.percentile(dist_list, 1, interpolation='lower')
-    hi = np.percentile(dist_list, 99, interpolation='higher')
-    ppl = np.extract(np.logical_and(dist_list >= lo, dist_list <= hi), dist_list).mean()
+        # Compute PPL.
+        dist_list = torch.cat(dist_list)[:n_samples].cpu().detach().numpy()
+        print("dist_list=", dist_list)
+        lo = np.percentile(dist_list, 10, interpolation='lower')
+        hi = np.percentile(dist_list, 90, interpolation='higher')
+        ppl = np.extract(np.logical_and(dist_list >= lo, dist_list <= hi), dist_list).mean()
+        dist_list_per_timesteps.append(float(ppl))
 
-    return float(ppl)
+    return dist_list_per_timesteps
 
+#################################################################
 
 def get_random_local_basis(model, random_state, noise = None, noise_dim = 512):
     '''
