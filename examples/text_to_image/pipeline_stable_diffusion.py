@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import sys
+sys.path.append('/data/projects/jaehoon/iso-diffusers/src/diffusers/pipelines/stable_diffusion/')
 import inspect
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union

@@ -2,14 +2,14 @@ from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
 from torchvision.utils import save_image
 import torch
 
-model_id = "stabilityai/stable-diffusion-2"
+model_id = "echarlaix/tiny-random-stable-diffusion-xl"
 
 scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
 pipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=scheduler, torch_dtype=torch.float16)
 pipe = pipe.to("cuda")
 
-prompt = "a professional photograph of two people with one wearing a baseball cap."
-num_images = 8
+prompt = "a professional photograph of a beautiful woman."
+num_images = 4
 device = "cuda"
 
 generator = torch.Generator(device=device)
@@ -25,7 +25,7 @@ for i in range(num_images):
     generator = generator.manual_seed(seed)
     
     image_latents = torch.randn(
-        (1, pipe.unet.in_channels, 768 // 8, 768 // 8),
+        (1, pipe.unet.in_channels, 32, 32),
         generator = generator,
         device = device,
         dtype=torch.float16
@@ -50,9 +50,9 @@ for i in range(num_images):
     print(f"{i+1}th image generated.")
 
 for i, img in enumerate(images):
-    img.save(f"output/stable-diffusion-2/image_{i}.png")
+    img.save(f"output/stable-diffusion/image_{i}.png")
 
 for i, feature in enumerate(features):
-    save_image(feature, f"output/stable-diffusion-2-latent/image_{i}.png")
+    save_image(feature, f"output/stable-diffusion-latent/image_{i}.png")
 
 print(seeds)

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=diff_65 # Submit a job named "example"
-#SBATCH --output=logs/log_65.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
+#SBATCH --job-name=diff_72 # Submit a job named "example"
+#SBATCH --output=logs/log_72.txt  # 스크립트 실행 결과 std output을 저장할 파일 이름
 
 #SBATCH --partition=a3000
 #SBATCH --gres=gpu:1          # Use 1 GPU
@@ -15,7 +15,7 @@ eval "$(conda shell.bash hook)"
 conda activate diffusers
 
 export MODEL_NAME="segmind/tiny-sd"
-export DATASET_NAME="Ryan-sjtu/ffhq512-caption" 
+export DATASET_NAME="cr7Por/ffhq_controlnet_5_18_23" 
 
 accelerate launch --mixed_precision="fp16" train_text_to_image.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
@@ -30,7 +30,7 @@ accelerate launch --mixed_precision="fp16" train_text_to_image.py \
   --max_grad_norm=1 \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
-  --output_dir="output/sd2-ffhq512-65" \
+  --output_dir="output/sd2-ffhq512-70" \
   --validation_epochs=1 \
   --validation_steps=5000 \
   --validation_prompts "there is a woman with long hair posing for a picture" "there is a baby sitting in the grass chewing on a toy" \
@@ -40,6 +40,7 @@ accelerate launch --mixed_precision="fp16" train_text_to_image.py \
   --split="train" \
   --lambda_pl=1 \
   --num_inference_steps=20 \
+  --ppl \
+  --fid \
   # --dists \
-  # --ppl \
-  # --fid \
+
