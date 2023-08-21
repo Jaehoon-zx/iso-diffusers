@@ -26,6 +26,7 @@ import datasets
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.autograd.functional as A
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -46,12 +47,11 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from eval import compute_fid, compute_ppl, add_dimensions, compute_distortion_per_timesteps
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
-
 logger = get_logger(__name__, log_level="INFO")
-
 
 def save_model_card(repo_id: str, images=None, base_model=str, dataset_name=str, repo_folder=None):
     img_str = ""
@@ -349,6 +349,34 @@ def parse_args():
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+
+    ################################################################
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Split of the dataset.",
+    )
+    parser.add_argument(
+        "--lambda_pl", type=float, default=None, help="Hyperparameter, lambda value for pl_penalty"
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=1000,
+        help="Number of inference steps of reverse solver.",
+    )
+    parser.add_argument(
+        "--fid_stats_path",
+        type=str,
+        default="assets/stats/ffhq_256.npz",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+
+    parser.add_argument("--fid", action="store_true", help="Compute metrics.")
+    parser.add_argument("--ppl", action="store_true", help="Compute metrics.")
+    parser.add_argument("--dists", action="store_true", help="Compute metrics.")
+    ################################################################
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -695,6 +723,7 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    pl_step = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -764,15 +793,140 @@ def main():
 
                 del pipeline
                 torch.cuda.empty_cache()
+    
+    def compute_metrics(epoch):
+        if accelerator.is_main_process:
+            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+                text = dataset[args.split][args.caption_column]
+                logger.info("Calculating Metrics... ")
+
+                pipeline = DiffusionPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            unet=accelerator.unwrap_model(unet),
+                            revision=args.revision,
+                            torch_dtype=weight_dtype,
+                        )
+                pipeline = pipeline.to(accelerator.device)
+                pipeline.set_progress_bar_config(disable=True)
+
+                if args.enable_xformers_memory_efficient_attention:
+                    pipeline.enable_xformers_memory_efficient_attention()
+
+                if args.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+                batch_size = args.train_batch_size
+                sampling_shape = (batch_size, 3, args.resolution, args.resolution)
+                # latent_sampling_shape = (batch_size, unet.in_channels, args.resolution // 8, args.resolution //8) # unet channel must be modified
+                latent_sampling_shape = (batch_size, unet.config.in_channels, unet.config.sample_size, unet.config.sample_size) # unet channel must be modified
+                if args.dists:
+                    print("Calculating Distortion per timesteps")
+                    dists = compute_distortion_per_timesteps(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+                    print("Distortion per timesteps=")
+                    for dist in dists:
+                        print(dist)
+                if args.ppl:
+                    print("Calculating PPL")
+                    ppl = compute_ppl(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+                if args.fid:
+                    print("Calculating FID")
+                    fid = compute_fid(1000, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
+
+                for tracker in accelerator.trackers:
+                    if tracker.name == "tensorboard":
+                        if args.ppl:
+                            accelerator.log({"ppl": ppl}, step=epoch)
+                        if args.fid:
+                            accelerator.log({"fid": fid}, step=epoch)
+                    else:
+                        logger.warn(f"logging not implemented for {tracker.name}")
+                
+                if args.ppl:
+                    logging.info('PPL at epoch %d: %.6f' % (epoch, ppl))
+                if args.fid:
+                    logging.info('FID at epoch %d: %.6f' % (epoch, fid))
+
+                del pipeline
+                torch.cuda.empty_cache()
+                return None
+
+#######################################################################
+    
+    def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+        """
+        Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
+        Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
+        """
+        std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+        std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+        # rescale the results from guidance (fixes overexposure)
+        noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+        # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+        noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+        return noise_cfg
+
+    def ddim_step(model, x, t, y, alpha_prod_t, alpha_prod_t_prev, prediction_type):
+        """
+        #DDIM step for v_prediction
+        """
+        # prompt_embeds = pipeline._encode_prompt(prompt=y, device=model.device, num_images_per_prompt=1, do_classifier_free_guidance=True)
+        alpha_prod_t = add_dimensions(alpha_prod_t, 3).to(model.device)
+        alpha_prod_t_prev = add_dimensions(alpha_prod_t_prev, 3).to(model.device)
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+        # Classifier free guidance
+        x_doubled = torch.cat([x] * 2)
+        t_doubled = torch.cat([t] * 2)
+        noise_pred = model(x_doubled, t_doubled, y)[0]
+
+        guidance_scale = 7.5
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_scale)
+
+        if prediction_type == 'v_prediction':
+            #DDIM, v-prediction
+            pred_original_sample = (alpha_prod_t**0.5) * x - (beta_prod_t**0.5) * noise_pred
+            pred_epsilon = (alpha_prod_t**0.5) * noise_pred + (beta_prod_t**0.5) * x
+        elif prediction_type == 'epsilon':
+            #DDIM, epsilon-prediction
+            pred_original_sample = (x - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+            pred_epsilon = noise_pred
+        else:
+            raise NotImplementedError()
+
+        std_dev = 0.0
+        # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev**2) ** (0.5) * pred_epsilon
+
+        # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        noise = torch.randn_like(x)
+        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction + std_dev * noise
+
+        return prev_sample
+
+########################################
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    pipeline = DiffusionPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            unet=accelerator.unwrap_model(unet),
+                            revision=args.revision,
+                            torch_dtype=weight_dtype,
+                        ).to(accelerator.device)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         log_validation()
+        compute_metrics(epoch)
         unet.train()
         train_loss = 0.0
+        train_loss_pl = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -795,8 +949,18 @@ def main():
 
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                ############################################
+                p = 0.2
+                r = random.random()
+                pl_cond = False
+                if r < p:
+                    timesteps = torch.randint(1, int(args.num_inference_steps * p), (bsz,), device=latents.device) * (1000//args.num_inference_steps)
+                    timesteps = timesteps.long()
+                    pl_cond = True
+                else:
+                    timesteps = torch.randint(int(args.num_inference_steps * p), args.num_inference_steps, (bsz,), device=latents.device) * (1000//args.num_inference_steps)
+                    timesteps = timesteps.long()
+                ############################################
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -804,6 +968,7 @@ def main():
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                prompt_embeds = pipeline._encode_prompt(prompt=None, device=latents.device, num_images_per_prompt=1, do_classifier_free_guidance=True, prompt_embeds=encoder_hidden_states) #[uncond_prompt_embeds, cond_prompt_embeds]
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -820,8 +985,42 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
+                ############################################
+                noise_scheduler.set_timesteps(num_inference_steps=args.num_inference_steps, device=accelerator.device)
+
+                t = timesteps.to(noise_scheduler.alphas_cumprod.device)
+                t_prev = noise_scheduler.previous_timestep(t).to(noise_scheduler.alphas_cumprod.device)
+
+                alpha_prod_t = noise_scheduler.alphas_cumprod[t]
+                alpha_prod_t_prev = noise_scheduler.alphas_cumprod[t_prev]
+                alpha_prod_t_prev[t_prev < 0] = noise_scheduler.one
+                ############################################
+
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    ############################################
+                    if args.lambda_pl > 0 and pl_cond:
+                        # print("timesteps", timesteps.shape)
+                        # print("encoder_hidden_states", encoder_hidden_states.shape)
+                        # print("prompt_embeds", prompt_embeds.shape)
+
+                        u = torch.randn_like(prompt_embeds, device=accelerator.device)/1e2
+                        Ju = A.jvp(lambda y: ddim_step(unet, noisy_latents, timesteps, y, alpha_prod_t, alpha_prod_t_prev, noise_scheduler.config.prediction_type), 
+                                    prompt_embeds, u, create_graph=True)[1]
+                        JTJu = A.vjp(lambda y: ddim_step(unet, noisy_latents, timesteps, y, alpha_prod_t, alpha_prod_t_prev, noise_scheduler.config.prediction_type), 
+                                     prompt_embeds, Ju, create_graph=True)[1]
+
+                        TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                        TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+
+                        pl_penalty = args.lambda_pl * (TrG2 / TrG ** 2)
+                        # pl_penalty = args.lambda_pl * TrG
+                        # logging.info(f"TrG2:{TrG2}, TrG:{TrG**2}, arg:{TrG2 / TrG**2}, pl_penalty:{pl_penalty}")
+
+                        loss += pl_penalty
+                    else:
+                        pl_penalty = 0 * loss
+                    ############################################
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -841,6 +1040,10 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
+                if args.lambda_pl > 0:
+                    avg_loss_pl = accelerator.gather(pl_penalty.repeat(args.train_batch_size)).mean()
+                    train_loss_pl += avg_loss_pl.item() / args.gradient_accumulation_steps
+
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -856,6 +1059,9 @@ def main():
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
+                if args.lambda_pl is not None and pl_cond:
+                    accelerator.log({"train_loss_pl": train_loss_pl}, step=pl_step)
+                    pl_step += 1
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -883,7 +1089,12 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if args.lambda_pl > 0:
+                logs = {"t": t.detach(), "t_prev": t_prev.detach(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                # logs = {"step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            else:
+                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

@@ -14,9 +14,9 @@ from diffusers import DiffusionPipeline, DDPMPipeline, UNet2DModel
 
 # Load from my checkpoint/unet
 model_path = "ddpm-ema-pokemon-64"
-unet = UNet2DModel.from_pretrained(model_path + "/checkpoint-20000/unet")
-# pipe = DDPMPipeline.from_pretrained(model_path, unet=unet, torch_dtype=torch.float16)
-pipe = DiffusionPipeline.from_pretrained(model_path).to("cuda")
+unet = UNet2DModel.from_pretrained("output/" + model_path + "/checkpoint-20000/unet")
+pipe = DDPMPipeline.from_pretrained(model_path, unet=unet, torch_dtype=torch.float16)
+# pipe = DiffusionPipeline.from_pretrained(model_path).to("cuda")
 
 frame_filepaths = pipe.walk(
     # prompts=['a boy', 'a house', 'a girl'],

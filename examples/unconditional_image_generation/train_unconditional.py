@@ -2,6 +2,7 @@ import argparse
 import inspect
 import logging
 import math
+import shutil
 import os
 import shutil
 from pathlib import Path
@@ -11,6 +12,9 @@ import accelerate
 import datasets
 import torch
 import torch.nn.functional as F
+import torch.autograd.functional as A
+import numpy as np
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
@@ -21,11 +25,14 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DModel_H, DDPMPipeline_H
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+
+from eval import compute_fid, compute_ppl, add_dimensions, compute_distortion_per_timesteps
+from utils import stereographic_proj, inv_stereographic_proj, riemmanian_metric, isometry_loss
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -139,7 +146,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
+    parser.add_argument("--save_images_epochs", type=int, default=1, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
@@ -261,6 +268,46 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
 
+    ################################
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--split", type=str, default="train", help="Split of the dataset.",
+    )
+    parser.add_argument(
+        "--lambda_iso", type=float, default=0, help="Hyperparameter, lambda value for pl_penalty"
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=1000,
+        help="Number of inference steps of reverse solver.",
+    )
+    parser.add_argument(
+        "--fid_stats_path",
+        type=str,
+        default="assets/stats/ffhq_256.npz",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--prompts_reps",
+        type=int,
+        default=1,
+        help=("Number of generating repetitions for each validation prompt."),
+    )
+
+    parser.add_argument("--fid", action="store_true", help="Compute metrics.")
+    parser.add_argument("--ppl", action="store_true", help="Compute metrics.")
+    parser.add_argument("--dists", action="store_true", help="Compute metrics.")
+    parser.add_argument("--subfolder", action="store_true", help="Whether to use subfolder='unet' in from_pretrained method.")
+
+    ################################
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -281,8 +328,57 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
     else:
         return f"{organization}/{model_id}"
 
+#######################################################################
+def compute_metrics(pipeline, args, accelerator, weight_dtype, step, dataset):
+    text = dataset[args.split][args.caption_column]
+    logger.info("Calculating Metrics... ")
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    batch_size = args.train_batch_size
+    sampling_shape = (batch_size, 3, args.resolution, args.resolution)
+    # latent_sampling_shape = (batch_size, unet.in_channels, args.resolution // 8, args.resolution //8) # unet channel must be modified
+    latent_sampling_shape = (batch_size, pipeline.unet.config.in_channels, pipeline.unet.config.sample_size, pipeline.unet.config.sample_size) # unet channel must be modified
+    if args.dists:
+        print("Calculating Distortion per timesteps")
+        dists = compute_distortion_per_timesteps(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+        print("Distortion per timesteps=")
+        for dist in dists:
+            print(dist)
+    if args.ppl:
+        print("Calculating PPL")
+        ppl = compute_ppl(n_samples=10, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+    if args.fid:
+        print("Calculating FID")
+        fid = compute_fid(100, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            accelerator.log({"ppl": ppl}, step=step)
+            accelerator.log({"fid": fid}, step=step)
+        else:
+            logger.warn(f"logging not implemented for {tracker.name}")
+    
+    logging.info('PPL at step %d: %.6f' % (step, ppl))
+    logging.info('FID at step %d: %.6f' % (step, fid))
+
+    del pipeline
+    torch.cuda.empty_cache()
+    return None
+
+#######################################################################
+
 
 def main(args):
+    # shutil.rmtree(args.output_dir)
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -292,15 +388,17 @@ def main(args):
         log_with=args.logger,
         project_config=accelerator_project_config,
     )
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+        args.mixed_precision = accelerator.mixed_precision
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        args.mixed_precision = accelerator.mixed_precision
 
     if args.logger == "tensorboard":
         if not is_tensorboard_available():
             raise ImportError("Make sure to install tensorboard if you want to use it for logging during training.")
-
-    elif args.logger == "wandb":
-        if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-        import wandb
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -317,7 +415,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel_H)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -327,7 +425,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DModel_H.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -369,8 +467,15 @@ def main(args):
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Initialize the model
-    if args.model_config_name_or_path is None:
-        model = UNet2DModel(
+    if args.pretrained_model_name_or_path is not None:
+        ########
+        if args.subfolder:
+            model = UNet2DModel_H.from_pretrained(args.pretrained_model_name_or_path, subfolder='unet')
+        else:
+            model = UNet2DModel_H.from_pretrained(args.pretrained_model_name_or_path)
+
+    elif args.model_config_name_or_path is None:
+        model = UNet2DModel_H(
             sample_size=args.resolution,
             in_channels=3,
             out_channels=3,
@@ -394,8 +499,8 @@ def main(args):
             ),
         )
     else:
-        config = UNet2DModel.load_config(args.model_config_name_or_path)
-        model = UNet2DModel.from_config(config)
+        config = UNet2DModel_H.load_config(args.model_config_name_or_path)
+        model = UNet2DModel_H.from_config(config)
 
     # Create EMA for the model.
     if args.use_ema:
@@ -405,7 +510,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=UNet2DModel,
+            model_cls=UNet2DModel_H,
             model_config=model.config,
         )
 
@@ -536,15 +641,79 @@ def main(args):
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            # accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(args.resume_from_checkpoint)
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
+    #######################################################################
+    def visual_inspection(pipeline, args, accelerator, weight_dtype, epoch):
+        logger.info("Visual Inspection & Model saving... ")
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
+        unet = pipeline.unet
+
+        if args.use_ema:
+            ema_model.store(unet.parameters())
+            ema_model.copy_to(unet.parameters())
+
+        # Generate sample images for visual inspection
+        if accelerator.is_main_process:
+            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                # run pipeline in inference (sample random noise and denoise)
+                images = pipeline(
+                    generator=generator,
+                    batch_size=args.eval_batch_size,
+                    num_inference_steps=args.ddpm_num_inference_steps,
+                    output_type="numpy",
+                ).images 
+
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+
+                # denormalize the images and save to tensorboard
+                images_processed = (images * 255).round().astype("uint8")
+
+                if args.logger == "tensorboard":
+                    if is_accelerate_version(">=", "0.17.0.dev0"):
+                        tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+                    else:
+                        tracker = accelerator.get_tracker("tensorboard")
+                    tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
+
+            if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+                # save the model
+                if args.use_ema:
+                    ema_model.store(unet.parameters())
+                    ema_model.copy_to(unet.parameters())
+
+                pipeline.save_pretrained(args.output_dir)
+
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+
+                if args.push_to_hub:
+                    repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+
+        return None
+    #######################################################################
+
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
+        unet = accelerator.unwrap_model(model)
+        pipeline = DDPMPipeline_H(
+                    unet=unet,
+                    scheduler=noise_scheduler,
+                )
+        model.eval()
+        visual_inspection(pipeline, args, accelerator, weight_dtype, epoch)
+        if args.ppl or args.fid or args.dists:
+            compute_metrics(pipeline, args, weight_dtype, global_step, dataset)
+
         model.train()
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -570,10 +739,28 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps).sample
+                model_output = model(noisy_images, timesteps)[0].sample # (Output, h_features)
+                h_feature = model(noisy_images, timesteps)[1] # (B, 512, 8, 8)
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
+
+                    ##########################
+                    if args.lambda_iso > 0:
+
+                        # u = torch.randn_like(noisy_images, device=accelerator.device)
+                        # Ju = A.jvp(lambda x: model(x, timesteps)[1], noisy_images, u, create_graph=True)[1]
+                        # JTJu = A.vjp(lambda x: model(x, timesteps)[1], noisy_images, Ju, create_graph=True)[1]
+
+                        # TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                        # TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+
+                        # pl_penalty = args.lambda_pl * (TrG2 / TrG ** 2)
+                        iso_loss = args.lambda_iso * isometry_loss(model, noisy_images, timesteps, accelerator.device)
+                        loss += iso_loss
+                    ##########################
+                    
+
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
@@ -587,7 +774,6 @@ def main(args):
                     raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
                 accelerator.backward(loss)
-
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -601,6 +787,10 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                accelerator.log({"train_loss": loss}, step=global_step)
+                if args.lambda_iso > 0:
+                    accelerator.log({"iso_loss": iso_loss}, step=global_step)
+                
                 if global_step % args.checkpointing_steps == 0:
                     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                     if args.checkpoints_total_limit is not None:
@@ -627,9 +817,16 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            if args.lambda_iso > 0:
+                # logs = {"t": t.detach(), "t_prev": t_prev.detach(), "step_loss": loss.detach().item(), "pl_penalty": pl_penalty.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"train_loss": loss.detach().item(), "iso_loss": iso_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            else:
+                logs = {"train_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+
             if args.use_ema:
-                logs["ema_decay"] = ema_model.cur_decay_value
+                # logs["ema_decay"] = ema_model.cur_decay_value
+                pass
+
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
         progress_bar.close()
@@ -637,67 +834,61 @@ def main(args):
         accelerator.wait_for_everyone()
 
         # Generate sample images for visual inspection
-        if accelerator.is_main_process:
-            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
-                unet = accelerator.unwrap_model(model)
+        # if accelerator.is_main_process:
+        #     if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+        #         unet = accelerator.unwrap_model(model)
 
-                if args.use_ema:
-                    ema_model.store(unet.parameters())
-                    ema_model.copy_to(unet.parameters())
+        #         if args.use_ema:
+        #             ema_model.store(unet.parameters())
+        #             ema_model.copy_to(unet.parameters())
 
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
+        #         pipeline = DDPMPipeline(
+        #             unet=unet,
+        #             scheduler=noise_scheduler,
+        #         )
 
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
-                # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
-                    generator=generator,
-                    batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
-                ).images
+        #         generator = torch.Generator(device=pipeline.device).manual_seed(0)
+        #         # run pipeline in inference (sample random noise and denoise)
+        #         images = pipeline(
+        #             generator=generator,
+        #             batch_size=args.eval_batch_size,
+        #             num_inference_steps=args.ddpm_num_inference_steps,
+        #             output_type="numpy",
+        #         ).images
 
-                if args.use_ema:
-                    ema_model.restore(unet.parameters())
+        #         if args.use_ema:
+        #             ema_model.restore(unet.parameters())
 
-                # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
+        #         # denormalize the images and save to tensorboard
+        #         images_processed = (images * 255).round().astype("uint8")
 
-                if args.logger == "tensorboard":
-                    if is_accelerate_version(">=", "0.17.0.dev0"):
-                        tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-                    else:
-                        tracker = accelerator.get_tracker("tensorboard")
-                    tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
-                elif args.logger == "wandb":
-                    # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
-                    accelerator.get_tracker("wandb").log(
-                        {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
-                        step=global_step,
-                    )
+        #         if args.logger == "tensorboard":
+        #             if is_accelerate_version(">=", "0.17.0.dev0"):
+        #                 tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+        #             else:
+        #                 tracker = accelerator.get_tracker("tensorboard")
+        #             tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
 
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-                # save the model
-                unet = accelerator.unwrap_model(model)
+        #     if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+        #         # save the model
+        #         unet = accelerator.unwrap_model(model)
 
-                if args.use_ema:
-                    ema_model.store(unet.parameters())
-                    ema_model.copy_to(unet.parameters())
+        #         if args.use_ema:
+        #             ema_model.store(unet.parameters())
+        #             ema_model.copy_to(unet.parameters())
 
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
+        #         pipeline = DDPMPipeline(
+        #             unet=unet,
+        #             scheduler=noise_scheduler,
+        #         )
 
-                pipeline.save_pretrained(args.output_dir)
+        #         pipeline.save_pretrained(args.output_dir)
 
-                if args.use_ema:
-                    ema_model.restore(unet.parameters())
+        #         if args.use_ema:
+        #             ema_model.restore(unet.parameters())
 
-                if args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+        #         if args.push_to_hub:
+        #             repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
 
     accelerator.end_training()
 
