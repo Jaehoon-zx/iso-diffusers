@@ -26,7 +26,7 @@ def riemmanian_metric(t, device):
     r, t = t[:,:1], t[:,1:]
     t_norm_sq = (t ** 2).sum()
 
-    G_r = torch.ones((G_t.shape[0], 1), device=device)
+    G_r = torch.ones((t.shape[0], 1), device=device)
     G_t = 4 * r ** 4/ (t_norm_sq + r ** 2) ** 2 * torch.ones_like(t)
 
     return torch.cat((G_r, G_t), dim=-1)

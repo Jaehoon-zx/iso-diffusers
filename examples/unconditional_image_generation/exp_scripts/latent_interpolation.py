@@ -13,16 +13,16 @@ from diffusers import DiffusionPipeline, DDPMPipeline, UNet2DModel
 # pipe.enable_attention_slicing()
 
 # Load from my checkpoint/unet
-model_path = "ddpm-ema-pokemon-64"
-unet = UNet2DModel.from_pretrained("output/" + model_path + "/checkpoint-20000/unet")
-pipe = DDPMPipeline.from_pretrained(model_path, unet=unet, torch_dtype=torch.float16)
-# pipe = DiffusionPipeline.from_pretrained(model_path).to("cuda")
+model_path = "anton-l/ddpm-ema-flowers-64"
+# unet = UNet2DModel.from_pretrained("output/" + model_path + "/checkpoint-20000/unet")
+# pipe = DDPMPipeline.from_pretrained(model_path, unet=unet, torch_dtype=torch.float16)
+pipe = DiffusionPipeline.from_pretrained(model_path).to("cuda")
 
 frame_filepaths = pipe.walk(
     # prompts=['a boy', 'a house', 'a girl'],
     seeds=[42, 1337, 1234],
     num_interpolation_steps=16,
-    output_dir='./pokemon-64',
+    output_dir='output/pokemon-64',
     batch_size=4,
     height=256,
     width=256,

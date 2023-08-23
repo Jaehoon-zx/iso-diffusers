@@ -27,6 +27,8 @@ from tqdm.auto import tqdm
 
 import diffusers
 from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DModel_H, DDPMPipeline_H
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -43,6 +45,7 @@ torch.backends.cuda.enable_math_sdp(True)
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
+
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """
@@ -151,7 +154,7 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_images_epochs", type=int, default=1, help="How often to save images during training.")
     parser.add_argument(
-        "--save_model_epochs", type=int, default=5, help="How often to save the model during training."
+        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -308,8 +311,6 @@ def parse_args():
     parser.add_argument("--ppl", action="store_true", help="Compute metrics.")
     parser.add_argument("--dists", action="store_true", help="Compute metrics.")
     parser.add_argument("--subfolder", action="store_true", help="Whether to use subfolder='unet' in from_pretrained method.")
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-
 
     ################################
 
@@ -335,6 +336,7 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 #######################################################################
 def compute_metrics(pipeline, args, accelerator, weight_dtype, step, dataset):
+    text = dataset[args.split][args.caption_column]
     logger.info("Calculating Metrics... ")
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
@@ -359,10 +361,10 @@ def compute_metrics(pipeline, args, accelerator, weight_dtype, step, dataset):
             print(dist)
     if args.ppl:
         print("Calculating PPL")
-        ppl = compute_ppl(n_samples=10, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device)
+        ppl = compute_ppl(n_samples=10, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
     if args.fid:
         print("Calculating FID")
-        fid = compute_fid(100, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device)
+        fid = compute_fid(100, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device, text)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -517,6 +519,29 @@ def main(args):
             model_cls=UNet2DModel_H,
             model_config=model.config,
         )
+
+    unet = model
+
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+
+        lora_attn_procs[name] = LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.rank,
+        )
+
+    unet.set_attn_processor(lora_attn_procs)
+    lora_layers = AttnProcsLayers(unet.attn_processors)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -704,8 +729,8 @@ def main(args):
                     repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
 
         return None
-    
     #######################################################################
+
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
         unet = accelerator.unwrap_model(model)
@@ -716,7 +741,7 @@ def main(args):
         model.eval()
         visual_inspection(pipeline, args, accelerator, weight_dtype, epoch)
         if args.ppl or args.fid or args.dists:
-            compute_metrics(pipeline, args, accelerator, weight_dtype, global_step, dataset)
+            compute_metrics(pipeline, args, weight_dtype, global_step, dataset)
 
         model.train()
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
@@ -756,13 +781,22 @@ def main(args):
             with accelerator.accumulate(model):
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps)[0].sample # (Output, h_features)
-                # h_feature = model(noisy_images, timesteps)[1] # (B, 512, 8, 8)
+                h_feature = model(noisy_images, timesteps)[1] # (B, 512, 8, 8)
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
 
                     ##########################
                     if args.lambda_iso > 0 and iso_cond:
+
+                        # u = torch.randn_like(noisy_images, device=accelerator.device)
+                        # Ju = A.jvp(lambda x: model(x, timesteps)[1], noisy_images, u, create_graph=True)[1]
+                        # JTJu = A.vjp(lambda x: model(x, timesteps)[1], noisy_images, Ju, create_graph=True)[1]
+
+                        # TrG = torch.sum(Ju.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+                        # TrG2 = torch.sum(JTJu.view(args.train_batch_size,-1) ** 2, dim=1).mean()
+
+                        # pl_penalty = args.lambda_pl * (TrG2 / TrG ** 2)
                         iso_loss = args.lambda_iso * isometry_loss(model, noisy_images, timesteps, accelerator.device)
                         loss += iso_loss
                     ##########################
@@ -795,7 +829,7 @@ def main(args):
                 global_step += 1
 
                 accelerator.log({"train_loss": loss}, step=global_step)
-                if args.lambda_iso > 0 and iso_cond:
+                if args.lambda_iso > 0:
                     accelerator.log({"iso_loss": iso_loss}, step=global_step)
                 
                 if global_step % args.checkpointing_steps == 0:
@@ -825,7 +859,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
             if args.lambda_iso > 0 and iso_cond:
-                logs = {"t": timesteps.detach(), "loss": loss.detach().item(), "loss_iso": iso_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"t": timesteps.detach().item(), "train_loss": loss.detach().item(), "iso_loss": iso_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 # logs = {"train_loss": loss.detach().item(), "iso_loss": iso_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             else:
                 logs = {"train_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -839,6 +873,63 @@ def main(args):
         progress_bar.close()
 
         accelerator.wait_for_everyone()
+
+        # Generate sample images for visual inspection
+        # if accelerator.is_main_process:
+        #     if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+        #         unet = accelerator.unwrap_model(model)
+
+        #         if args.use_ema:
+        #             ema_model.store(unet.parameters())
+        #             ema_model.copy_to(unet.parameters())
+
+        #         pipeline = DDPMPipeline(
+        #             unet=unet,
+        #             scheduler=noise_scheduler,
+        #         )
+
+        #         generator = torch.Generator(device=pipeline.device).manual_seed(0)
+        #         # run pipeline in inference (sample random noise and denoise)
+        #         images = pipeline(
+        #             generator=generator,
+        #             batch_size=args.eval_batch_size,
+        #             num_inference_steps=args.ddpm_num_inference_steps,
+        #             output_type="numpy",
+        #         ).images
+
+        #         if args.use_ema:
+        #             ema_model.restore(unet.parameters())
+
+        #         # denormalize the images and save to tensorboard
+        #         images_processed = (images * 255).round().astype("uint8")
+
+        #         if args.logger == "tensorboard":
+        #             if is_accelerate_version(">=", "0.17.0.dev0"):
+        #                 tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+        #             else:
+        #                 tracker = accelerator.get_tracker("tensorboard")
+        #             tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
+
+        #     if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+        #         # save the model
+        #         unet = accelerator.unwrap_model(model)
+
+        #         if args.use_ema:
+        #             ema_model.store(unet.parameters())
+        #             ema_model.copy_to(unet.parameters())
+
+        #         pipeline = DDPMPipeline(
+        #             unet=unet,
+        #             scheduler=noise_scheduler,
+        #         )
+
+        #         pipeline.save_pretrained(args.output_dir)
+
+        #         if args.use_ema:
+        #             ema_model.restore(unet.parameters())
+
+        #         if args.push_to_hub:
+        #             repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
 
     accelerator.end_training()
 
