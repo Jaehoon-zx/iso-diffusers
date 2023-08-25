@@ -33,7 +33,6 @@ def get_activations(dl, model, batch_size, device, max_samples, dl_include_step=
             elif len(batch.shape) == 3:  # if image is gray scale
                 batch = batch.unsqueeze(1).repeat(1, 3, 1, 1)
 
-
             with torch.no_grad():
                 batch = (batch / 2. + .5).clip(0., 1.)
                 batch = (batch * 255.).to(torch.uint8)
@@ -82,7 +81,6 @@ def main(args):
             args.path,
             None,
             cache_dir=None,
-            use_auth_token=True
         )
     if not os.path.exists(args.fid_dir):
         os.makedirs(args.fid_dir)
@@ -99,9 +97,10 @@ def main(args):
     
     caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
     
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=None
-    )
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=None
+    # )
+
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
@@ -136,11 +135,21 @@ def main(args):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
+
         return examples
+
+    def preprocess_train_ddpm(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
+
+        return examples
+
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # dataset = ImageFolderDataset(args.path)
-    dataset = pre_dataset[args.split].with_transform(preprocess_train)
+    dataset = pre_dataset[args.split].with_transform(preprocess_train_ddpm)
+    # dataset = pre_dataset[args.split].with_transform(preprocess_train)
     # queue = torch.utils.data.DataLoader(dataset=dataset, batch_size=args.batch_size, pin_memory=True, num_workers=0)
     
     def collate_fn(examples):
@@ -148,11 +157,17 @@ def main(args):
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
         return {"pixel_values": pixel_values, "input_ids": input_ids}
+
+    def collate_fn_ddpm(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        # input_ids = torch.stack([example["input_ids"] for example in examples])
+        return {"pixel_values": pixel_values}
     
-    queue  = torch.utils.data.DataLoader(
+    queue = torch.utils.data.DataLoader(
         dataset,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_ddpm,
         batch_size=args.batch_size,
         num_workers=0,
     )
@@ -175,15 +190,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default="nielsr/CelebA-faces")
+    parser.add_argument('--path', type=str, default="mattymchen/celeba-hq")
     parser.add_argument('--pretrained_model_name_or_path', type=str, default="google/ddpm-ema-celebahq-256")
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--resolution', type=int, default=256)
     parser.add_argument('--center_crop', type=bool, default=True)
     parser.add_argument('--random_flip', type=bool, default=True)
     parser.add_argument('--fid_dir', type=str, default='./')
     parser.add_argument('--split', type=str, default='train')
-    parser.add_argument('--file', type=str, default="assets/stats/celebahq_new.npz")
+    parser.add_argument('--file', type=str, default="assets/stats/celebahq_256.npz")
     parser.add_argument('--max_samples', type=int, default=None)
     
     args = parser.parse_args()

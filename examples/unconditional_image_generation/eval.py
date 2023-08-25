@@ -108,6 +108,8 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
         offset = np.eye(sigma1.shape[0]) * eps
         covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
+    print("s1 dot s2", sigma1.dot(sigma2))
+    print("covmean", covmean)
     # Numerical error might give slight imaginary component
     if np.iscomplexobj(covmean):
         if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
@@ -124,13 +126,15 @@ def compute_fid(n_samples, n_gpus, sampling_shape, sampler, gen, stats_path, dev
     num_samples_per_gpu = int(np.ceil(n_samples / n_gpus))
     tf_toTensor = ToTensor()
     transform = Compose([ToTensor()])
-    text = np.array(text)
+    print(sampling_shape)
+
     def generator(num_samples):
         num_sampling_rounds = int(np.ceil(num_samples / sampling_shape[0]))
         with torch.autocast("cuda"):
             for _ in tqdm(range(num_sampling_rounds)):
-                x = sampler(batch_size= sampling_shape[0], num_inference_steps=20, generator=gen, output_type='pt').images
-                x = torch.tensor((x * 255.), device=device).to(torch.uint8) # genie code debugging
+                x = sampler(batch_size= sampling_shape[0], num_inference_steps=20, generator=gen, output_type='np').images
+                x = torch.tensor(x * 255, device=device).to(torch.uint8) # Range Debugging
+                x = x.permute(0, 3, 2, 1)
                 yield x
 
     with open_url('https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl') as f:
@@ -143,15 +147,23 @@ def compute_fid(n_samples, n_gpus, sampling_shape, sampler, gen, stats_path, dev
     sigma = np.cov(act, rowvar=False)
     m = torch.from_numpy(mu).cuda()
     s = torch.from_numpy(sigma).cuda()
+
+    print(m.shape, s.shape)
     # average_tensor(m)
     # average_tensor(s)
 
     all_pool_mean = m.cpu().numpy()
     all_pool_sigma = s.cpu().numpy()
 
+    print(all_pool_mean, all_pool_sigma)
+    print()
+
     stats = np.load(stats_path)
     data_pools_mean = stats['mu']
     data_pools_sigma = stats['sigma']
+
+    print(data_pools_mean, data_pools_sigma)
+
     fid = calculate_frechet_distance(data_pools_mean,
                 data_pools_sigma, all_pool_mean, all_pool_sigma)
     return fid

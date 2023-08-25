@@ -294,7 +294,7 @@ def parse_args():
     parser.add_argument(
         "--fid_stats_path",
         type=str,
-        default="assets/stats/ffhq_256.npz",
+        default="assets/stats/celebahq_256.npz",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -341,28 +341,28 @@ def compute_metrics(pipeline, args, accelerator, weight_dtype, step, dataset):
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
-
     if args.seed is None:
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    batch_size = args.train_batch_size
+    batch_size = args.train_batch_size * (4 if args.lambda_iso == 0 else 1)
     sampling_shape = (batch_size, 3, args.resolution, args.resolution)
-    # latent_sampling_shape = (batch_size, unet.in_channels, args.resolution // 8, args.resolution //8) # unet channel must be modified
     latent_sampling_shape = (batch_size, pipeline.unet.config.in_channels, pipeline.unet.config.sample_size, pipeline.unet.config.sample_size) # unet channel must be modified
     if args.dists:
         print("Calculating Distortion per timesteps")
-        dists = compute_distortion_per_timesteps(n_samples=100, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
+        dists = compute_distortion_per_timesteps(n_samples=10, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device, text=text)
         print("Distortion per timesteps=")
         for dist in dists:
             print(dist)
     if args.ppl:
         print("Calculating PPL")
         ppl = compute_ppl(n_samples=10, n_gpus=1, sampling_shape=latent_sampling_shape, sampler=pipeline, gen=generator, device=accelerator.device)
+        logging.info('PPL at step %d: %.6f' % (step, ppl))
     if args.fid:
         print("Calculating FID")
-        fid = compute_fid(100, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device)
+        fid = compute_fid(10, 1, sampling_shape, pipeline, generator, args.fid_stats_path, accelerator.device)
+        logging.info('FID at step %d: %.6f' % (step, fid))
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -371,9 +371,6 @@ def compute_metrics(pipeline, args, accelerator, weight_dtype, step, dataset):
         else:
             logger.warn(f"logging not implemented for {tracker.name}")
     
-    logging.info('PPL at step %d: %.6f' % (step, ppl))
-    logging.info('FID at step %d: %.6f' % (step, fid))
-
     del pipeline
     torch.cuda.empty_cache()
     return None
@@ -729,6 +726,7 @@ def main(args):
                 continue
 
             clean_images = batch["input"]
+            # logging.info(type(clean_images), clean_images.max(), clean_images.min())
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
             bsz = clean_images.shape[0]
